@@ -24,6 +24,7 @@ type ChatDocument struct {
 }
 
 const (
+	MaxContextTokens = 2000 // 最大上下文 token 数
 	MaxDocumentSize = 1024 * 1024 * 25 // 最大文档大小 (25 MB)
 )
 
@@ -246,9 +247,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	// 将聊天记录转换为文档格式
     var doc strings.Builder
-    for _, msg := range openAIReq.Messages {
+    for _, msg := range openAIReq.Messages[:len(openAIReq.Messages)-1] {
         doc.WriteString(fmt.Sprintf("[%s]: %s\n\n", msg.Role, msg.Content))
     }
+
+	// 检查文档大小
+	docSize := len(doc.String())
+	if docSize > MaxDocumentSize {
+		fmt.Printf("文档大小 (%d bytes) 超过最大限制 (%d bytes)\n", docSize, MaxDocumentSize)
+		http.Error(w, "Document size exceeds maximum limit", http.StatusBadRequest)
+		return
+	}
 
 	// 获取 nonce
 	nonceResp, err := getNonce(dsToken)
@@ -299,6 +308,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	conversationTurnId := uuid.New().String()
 	traceId := fmt.Sprintf("%s|%s|%s", chatId, conversationTurnId, time.Now().Format(time.RFC3339))
 
+	// 处理最后一条消息
+	lastMessage := openAIReq.Messages[len(openAIReq.Messages)-1]
+	lastMessageTokens, err := countTokens([]Message{lastMessage})
+	if err != nil {
+		http.Error(w, "Failed to count tokens", http.StatusInternalServerError)
+		return
+	}
+
 	// 构建查询参数
 	q := youReq.URL.Query()
 
@@ -319,6 +336,56 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	q.Add("enable_agent_clarification_questions", "true")
 	q.Add("traceId", traceId)
 	q.Add("use_nested_youchat_updates", "true")
+
+	// 如果最后一条消息超过限制，使用文件上传
+	if lastMessageTokens > MaxContextTokens {
+		// 获取 nonce
+		nonceResp, err := getNonce(dsToken)
+		if err != nil {
+			fmt.Printf("获取 nonce 失败: %v\n", err)
+			http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
+			return
+		}
+
+		// 创建临时文件
+		tempFile := fmt.Sprintf("temp_%s.txt", nonceResp.Uuid)
+		if err := os.WriteFile(tempFile, []byte(lastMessage.Content), 0644); err != nil {
+			fmt.Printf("创建临时文件失败: %v\n", err)
+			http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
+			return
+		}
+		defer os.Remove(tempFile)
+
+		// 上传文件
+		uploadResp, err := uploadFile(dsToken, tempFile)
+		if err != nil {
+			fmt.Printf("上传文件失败: %v\n", err)
+			http.Error(w, "Failed to upload file", http.StatusInternalServerError)
+			return
+		}
+
+		// 添加文件源信息
+		sources = append(sources, map[string]interface{}{
+			"source_type":   "user_file",
+			"filename":      uploadResp.Filename,
+			"user_filename": uploadResp.UserFilename,
+			"size_bytes":    len(lastMessage.Content),
+		})
+
+		// 添加 sources 参数
+		sourcesJSON, _ := json.Marshal(sources)
+		q.Add("sources", string(sourcesJSON))
+
+		// 使用文件引用作为查询
+		q.Add("q", fmt.Sprintf("Please review the attached file: %s", uploadResp.UserFilename))
+	} else {
+		// 如果有之前上传的文件，添加 sources
+		if len(sources) > 0 {
+			sourcesJSON, _ := json.Marshal(sources)
+			q.Add("sources", string(sourcesJSON))
+		}
+		q.Add("q", lastMessage.Content)
+	}
 
 	q.Add("chat", string(chatHistoryJSON))
 	youReq.URL.RawQuery = q.Encode()
@@ -442,6 +509,8 @@ func handleNonStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 		http.Error(w, "Error reading response", http.StatusInternalServerError)
 		return
 	}
+
+	fmt.Printf("完整响应: %s\n", fullResponse.String())
 
 	// 构建 OpenAI 格式的非流式响应
 	openAIResp := OpenAIResponse{
@@ -578,6 +647,32 @@ func uploadFile(dsToken, filePath string) (*UploadResponse, error) {
 		return nil, err
 	}
 	return &uploadResp, nil
+}
+
+// 计算消息的 token 数（使用字符估算方法）
+func countTokens(messages []Message) (int, error) {
+	totalTokens := 0
+	for _, msg := range messages {
+		content := msg.Content
+		englishCount := 0
+		chineseCount := 0
+
+		// 遍历每个字符
+		for _, r := range content {
+			if r <= 127 { // ASCII 字符（英文和符号）
+				englishCount++
+			} else { // 非 ASCII 字符（中文等）
+				chineseCount++
+			}
+		}
+
+		// 计算 tokens：英文字符 * 0.3 + 中文字符 * 0.6
+		tokens := int(float64(englishCount)*0.3 + float64(chineseCount)*1)
+
+		// 加上角色名的 token（约 2 个）
+		totalTokens += tokens + 2
+	}
+	return totalTokens, nil
 }
 
 // 将 system 消息转换为第一条 user 消息
